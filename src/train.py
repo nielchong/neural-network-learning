@@ -8,19 +8,22 @@ import os
 
 sys.path.append(os.path.dirname(__file__))
 from model import PricePredictor, get_device
+import config
 
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
 
 class PriceDataset(Dataset):
     """
+    Sliding window dataset for price sequences.
+
     Each sample:
-      x = window of past prices (input)
-      y = next price (target to predict)
-      label = whether that next price is an anomaly
+        x     = window of past prices (input)
+        y     = next price (target to predict)
+        label = whether that next price is an anomaly
     """
 
-    def __init__(self, prices, labels, window_size=7, only_normal=False):
+    def __init__(self, prices, labels, window_size=config.WINDOW_SIZE, only_normal=False):
         self.sequences = []
         self.targets = []
         self.target_labels = []
@@ -31,7 +34,7 @@ class PriceDataset(Dataset):
             next_label = labels[i + window_size]
 
             if only_normal:
-                # Skip if next price is an anomaly
+                # Skip windows where the target is an anomaly
                 # Model should only learn to predict normal prices
                 if next_label == 1:
                     continue
@@ -58,6 +61,10 @@ class PriceDataset(Dataset):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def normalise(prices):
+    """
+    Min-max normalisation. Scales prices to [0, 1].
+    Returns normalised prices, and the original min/max for reversal.
+    """
     p_min = prices.min()
     p_max = prices.max()
     return (prices - p_min) / (p_max - p_min + 1e-8), p_min, p_max
@@ -65,65 +72,86 @@ def normalise(prices):
 
 # ── Training ──────────────────────────────────────────────────────────────────
 
-def train_model(product="fish_sauce", window_size=7, epochs=100):
+def train_model(
+    product=config.PRODUCT,
+    window_size=config.WINDOW_SIZE,
+    epochs=config.EPOCHS
+):
+    """
+    Full training pipeline for one product.
+
+    Loads data → normalises → creates datasets → trains model
+    → saves best weights → returns model, full dataset, and
+    normalisation parameters for downstream use.
+
+    Returns:
+        model        — trained PricePredictor instance
+        full_dataset — all data including anomalies, for evaluation
+        p_min        — original minimum price, for reversing normalisation
+        p_max        — original maximum price, for reversing normalisation
+    """
 
     device = get_device()
     print(f"Using device: {device}")
     print(f"Training model for: {product}\n")
 
-    # Load data
-    df = pd.read_csv("data/price_history.csv")
+    # ── Load data ─────────────────────────────────────────────────────────────
+    df = pd.read_csv(config.DATA_PATH)
     product_df = df[df["product"] == product].sort_values("date")
 
     prices = product_df["price"].values.astype(np.float32)
     labels = product_df["is_anomaly"].values.astype(np.float32)
 
-    # Normalise
+    # ── Normalise ─────────────────────────────────────────────────────────────
     prices_norm, p_min, p_max = normalise(prices)
     print(f"Price range: ${p_min:.2f} – ${p_max:.2f}")
 
-    # Train/validation split
-    split = int(len(prices_norm) * 0.8)
+    # ── Train / validation split ──────────────────────────────────────────────
+    split = int(len(prices_norm) * config.TRAIN_SPLIT)
     train_prices = prices_norm[:split]
     train_labels = labels[:split]
 
     print(f"Training days:   {split}")
     print(f"Validation days: {len(prices_norm) - split}\n")
 
-    # Training dataset — only windows predicting normal next prices
+    # ── Datasets ──────────────────────────────────────────────────────────────
+    # Training — normal windows only so the model learns normal price behaviour
     train_dataset = PriceDataset(
         train_prices, train_labels, window_size, only_normal=True
     )
 
-    # Full dataset — all data for evaluation
+    # Full dataset — all data including anomalies, used for evaluation
     full_dataset = PriceDataset(
         prices_norm, labels, window_size, only_normal=False
     )
 
     if len(train_dataset) == 0:
         print("ERROR: No training sequences. Reduce window_size.")
-        return None, None
+        return None, None, None, None
 
+    # ── DataLoader ────────────────────────────────────────────────────────────
     train_loader = DataLoader(
-        train_dataset, batch_size=16, shuffle=True
+        train_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=True
     )
 
-    # Model
-    model = PricePredictor(
-        input_size=1,
-        hidden_size=32,
-        num_layers=2
-    ).to(device)
+    # ── Model ─────────────────────────────────────────────────────────────────
+    model = PricePredictor().to(device)
 
     criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, patience=10, factor=0.5
+        optimizer,
+        patience=config.SCHEDULER_PATIENCE,
+        factor=config.SCHEDULER_FACTOR
     )
 
-    # Training loop
+    # ── Training loop ─────────────────────────────────────────────────────────
     print("Training...\n")
     best_loss = float("inf")
+    model_path = os.path.join(config.MODEL_DIR, f"{product}_best_model.pth")
+    os.makedirs(config.MODEL_DIR, exist_ok=True)
 
     for epoch in range(epochs):
         model.train()
@@ -151,86 +179,26 @@ def train_model(product="fish_sauce", window_size=7, epochs=100):
 
         if avg_loss < best_loss:
             best_loss = avg_loss
-            torch.save(
-                model.state_dict(),
-                f"models/{product}_best_model.pth"
-            )
+            torch.save(model.state_dict(), model_path)
 
-    print(f"\nBest loss: {best_loss:.6f}")
-    print(f"Model saved to models/{product}_best_model.pth\n")
+    print(f"\nBest training loss: {best_loss:.6f}")
+    print(f"Model saved to {model_path}\n")
 
-    return model, full_dataset
-
-
-# ── Evaluation ────────────────────────────────────────────────────────────────
-
-def evaluate_model(model, dataset, device):
-
-    model.eval()
-    scores = []
-    labels = []
-
-    with torch.no_grad():
-        for i in range(len(dataset)):
-            x, y, label = dataset[i]
-            x = x.unsqueeze(0).to(device)
-            y = y.to(device)
-            score = model.anomaly_score(x, y).item()
-            scores.append(score)
-            labels.append(label.item())
-
-    scores = np.array(scores)
-    labels = np.array(labels)
-
-    # Score distribution — this is the key diagnostic
-    normal_scores = scores[labels == 0]
-    anomaly_scores = scores[labels == 1]
-
-    print("Score distribution:")
-    print(f"  Normal  — mean: {normal_scores.mean():.6f}  "
-          f"max: {normal_scores.max():.6f}")
-
-    if len(anomaly_scores) > 0:
-        print(f"  Anomaly — mean: {anomaly_scores.mean():.6f}  "
-              f"max: {anomaly_scores.max():.6f}")
-    else:
-        print("  No anomalies in dataset")
-        return
-
-    # Threshold from normal scores
-    threshold = np.percentile(normal_scores, 95)
-    print(f"\nThreshold (95th pct of normal): {threshold:.6f}")
-
-    flagged = scores > threshold
-    actual = labels == 1
-    correct = flagged & actual
-
-    print(f"Flagged as anomalies:           {flagged.sum()}")
-    print(f"Actual anomalies:               {actual.sum()}")
-    print(f"Correctly identified:           {correct.sum()}")
-
-    if actual.sum() > 0:
-        recall = correct.sum() / actual.sum() * 100
-        precision = (correct.sum() / flagged.sum() * 100
-                     if flagged.sum() > 0 else 0)
-        print(f"Recall:                         {recall:.1f}%")
-        print(f"Precision:                      {precision:.1f}%")
+    return model, full_dataset, p_min, p_max
 
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    from evaluate import evaluate_model
+
     device = get_device()
 
-    model, dataset = train_model(
-        product="fish_sauce",
-        window_size=7,
-        epochs=100
-    )
+    model, dataset, p_min, p_max = train_model()
 
     if model and dataset:
-        model.load_state_dict(torch.load(
-            "models/fish_sauce_best_model.pth",
-            map_location=device
-        ))
+        model_path = os.path.join(
+            config.MODEL_DIR, f"{config.PRODUCT}_best_model.pth"
+        )
+        model.load_state_dict(torch.load(model_path, map_location=device))
         evaluate_model(model, dataset, device)
