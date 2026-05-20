@@ -53,6 +53,5 @@ def generate_price_data(
     print(f"Generated {len(df)} price records for {len(products)} products")
     return df
 
-
 if __name__ == "__main__":
     generate_price_data()
